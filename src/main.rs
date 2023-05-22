@@ -1,132 +1,165 @@
-use std::{collections::HashMap, fmt, fs, io::Read, io::Write, path::PathBuf};
+use std::path::PathBuf;
 
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
 use clap::Parser;
+use cli::{Cli, Commands};
 use hmac::Hmac;
 use pbkdf2::pbkdf2_array;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use vault::{Vault, Entry};
 
-#[derive(clap::Parser)]
-#[command(author, version, about, long_about = None)]
-#[command(propagate_version = true)]
-struct Cli {
-    #[command(subcommand)]
-    commands: Commands,
-}
+mod cli {
+    #[derive(clap::Parser)]
+    #[command(author, version, about, long_about = None)]
+    #[command(propagate_version = true)]
+    pub struct Cli {
+        #[command(subcommand)]
+        pub commands: Commands,
+    }
 
-#[derive(clap::Subcommand)]
-enum Commands {
-    Register {
-        #[arg(short, long)]
-        /// name your vault entry for easy searching
-        name: String,
-        #[arg(short, long)]
-        /// the website domain your entry is tied to
-        domain: String,
-        #[arg(short, long)]
-        /// the username used to register on the website domain
-        username: String,
-        #[arg(short, long)]
-        /// the password used for the account registered (will be automatically generated if empty)
-        password: Option<String>,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Entry {
-    name: String,
-    domain: String,
-    username: String,
-    password: String,
-}
-
-impl Entry {
-    fn new(name: String, domain: String, username: String, password: String) -> Self {
-        return Entry {
-            name,
-            domain,
-            username,
-            password,
-        };
+    #[derive(clap::Subcommand)]
+    pub enum Commands {
+        Register {
+            #[arg(short, long)]
+            /// name your vault entry for easy searching
+            name: String,
+            #[arg(short, long)]
+            /// the website domain your entry is tied to
+            domain: String,
+            #[arg(short, long)]
+            /// the username used to register on the website domain
+            username: String,
+            #[arg(short, long)]
+            /// the password used for the account registered (will be automatically generated if empty)
+            password: Option<String>,
+        },
+        Find {
+            name: String,
+        }
     }
 }
 
-#[derive(Debug)]
-struct Vault {
-    key: [u8; 32],
-    entries: HashMap<String, Entry>,
-}
 
-impl Vault {
-    fn new_from_file(path: &PathBuf, key: [u8; 32]) -> Self {
-        // @TOOD read nonce file for decryption
+mod vault {
+    use core::fmt;
+    use std::{collections::HashMap, path::PathBuf, fs::File, io::{Write, Read}};
 
-        let mut file = fs::File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)
-            .expect("unable to open vault file");
+    use aes_gcm::{Aes256Gcm, Nonce, KeyInit, aead::Aead};
+    use rand::Rng;
+    use serde::{Serialize, Deserialize};
 
-        let mut buf = String::new();
-        file.read_to_string(&mut buf)
-            .expect("unable to read vault file");
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct Entry {
+        pub name: String,
+        pub domain: String,
+        pub username: String,
+        pub password: String,
+    }
 
-        if buf.is_empty() {
+    impl Entry {
+        pub fn new(name: String, domain: String, username: String, password: String) -> Self {
+            return Entry {
+                name,
+                domain,
+                username,
+                password,
+            };
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct Vault {
+        pub key: [u8; 32],
+        pub entries: HashMap<String, Entry>,
+    }
+
+    impl Vault {
+        pub fn new_from_file(path: &PathBuf, key: [u8; 32]) -> Self {
+            // @TOOD read nonce file for decryption
+
+            let mut file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(path)
+                .expect("unable to open vault file");
+
+            let mut buf = String::new();
+            file.read_to_string(&mut buf)
+                .expect("unable to read vault file");
+
+            if buf.is_empty() {
+                return Vault {
+                    key,
+                    entries: HashMap::new(),
+                };
+            }
+
             return Vault {
                 key,
-                entries: HashMap::new(),
+                entries: serde_json::from_str(&buf).expect("unable to deserialize vault"),
             };
         }
 
-        // @TODO: decrypt vault
+        pub fn register_entry(&mut self, entry: Entry) -> Result<(), DuplicateEntryError> {
+            if self.entries.contains_key(entry.name.as_str()) {
+                return Err(DuplicateEntryError);
+            }
 
-        return Vault {
-            key,
-            entries: serde_json::from_str(&buf).expect("unable to deserialize vault"),
-        };
-    }
+            self.entries.insert(entry.name.to_string(), entry);
 
-    fn register_entry(&mut self, entry: Entry) -> Result<(), DuplicateEntryError> {
-        if self.entries.contains_key(entry.name.as_str()) {
-            return Err(DuplicateEntryError);
+            return Ok(());
         }
 
-        self.entries.insert(entry.name.to_string(), entry);
+        pub fn get_entry(&self, name: String) -> Result<&Entry, EntryNotFoundError> {
+            return match self.entries.get(name.as_str()) {
+                Some(entry) => Ok(entry),
+                None => Err(EntryNotFoundError),
+            };
+        }
 
-        return Ok(());
+        pub fn encyrpt_and_save(&self, path: &PathBuf) {
+            let mut file = File::options()
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .unwrap();
+
+            let cipher = Aes256Gcm::new_from_slice(&self.key).unwrap();
+            let nonce_bytes = rand::thread_rng().gen::<[u8; 12]>();
+            let nonce = Nonce::from_slice(&nonce_bytes);
+
+            let mut nonce_file = File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(".nonce").unwrap();
+
+            nonce_file.write(nonce).unwrap();
+
+            let json = serde_json::to_string(&self.entries).unwrap();
+            let cipher_text = cipher.encrypt(nonce, json.as_bytes()).unwrap();
+
+            file.write(cipher_text.as_slice()).unwrap();
+        }
     }
 
-    fn encyrpt_and_save(&self, path: &PathBuf) {
-        let mut file = fs::File::options()
-            .write(true)
-            .truncate(true)
-            .open(path)
-            .unwrap();
+    #[derive(Debug, Clone)]
+    pub struct DuplicateEntryError;
 
-        let cipher = Aes256Gcm::new_from_slice(&self.key).unwrap();
-        // @TODO: write nonce to file
-        let nonce_bytes = rand::thread_rng().gen::<[u8; 12]>();
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        let json = serde_json::to_string(&self.entries).unwrap();
-        let cipher_text = cipher.encrypt(nonce, json.as_bytes()).unwrap();
-
-        file.write(cipher_text.as_slice()).unwrap();
+    impl fmt::Display for DuplicateEntryError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            return write!(f, "entry already exists in vault");
+        }
     }
-}
 
-#[derive(Debug, Clone)]
-struct DuplicateEntryError;
+    #[derive(Debug, Clone)]
+    pub struct EntryNotFoundError;
 
-impl fmt::Display for DuplicateEntryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        return write!(f, "entry already exists in vault");
+    impl fmt::Display for EntryNotFoundError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            return write!(f, "entry already exists in vault");
+        }
     }
 }
 
@@ -185,6 +218,9 @@ fn main() {
             vault.register_entry(entry).unwrap();
 
             vault.encyrpt_and_save(&vault_path);
+        },
+        Commands::Find { name } => {
+            println!("{name}");
         }
     }
 }
